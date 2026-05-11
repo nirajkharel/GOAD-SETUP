@@ -1260,6 +1260,800 @@ Typical recovery on a populated host: **80–250 GB**, primarily from:
 
 ---
 
+# Wazuh XDR/SIEM Integration with GOAD-Light on Ludus
+
+A complete guide from a deployed GOAD-Light range through full Wazuh integration, agent deployment, Sysmon + PowerShell logging, custom detection rules, and attack testing.
+
+---
+
+## Prerequisites
+
+This guide assumes you already have:
+
+- A Ludus server with GOAD-Light deployed and all 4 VMs (`router`, `DC01`, `DC02`, `SRV02`, `kali`) showing as `On` in `ludus range status`
+- An admin user with the `GOAD_USER` environment variable exported (e.g., `export GOAD_USER=GOADLightbbe829`)
+- WireGuard access to the range (so you can hit the Wazuh dashboard from your laptop)
+- Templates built: `win2019-server-x64-template`, `kali-x64-desktop-template`, `debian-11-x64-server-template`
+
+Verify with:
+
+```bash
+ludus --user $GOAD_USER range status
+```
+
+Expected output: 5 VMs (router + 3 Windows + Kali), all powered on.
+
+---
+
+## Architecture Overview
+
+| Component | VM | IP | Role |
+|-----------|----|----|------|
+| Wazuh Server (manager + indexer + dashboard) | Kali | `10.3.10.99` | SIEM ingest + UI |
+| Wazuh Agent | DC01 (`kingslanding`) | `10.3.10.10` | Primary DC, parent domain |
+| Wazuh Agent | DC02 (`winterfell`) | `10.3.10.11` | Child domain DC |
+| Wazuh Agent | SRV02 (`castelblack`) | `10.3.10.22` | Member server |
+| Router (no agent) | `router-debian11-x64` | `10.3.10.254` | Range routing |
+
+All VMs on **VLAN 10** in network `10.3.0.0/16`. Agents talk to the manager on **TCP 1514** (events) and **TCP 1515** (enrollment). Dashboard reachable on **TCP 443** at `https://10.3.10.99`.
+
+---
+
+## Phase 1 — Install Wazuh Roles and Update Range Config
+
+### 1.1 Add the Ansible roles to your Ludus user
+
+```bash
+ludus ansible role add aleemladha.wazuh_server_install --user $GOAD_USER
+ludus ansible role add aleemladha.ludus_wazuh_agent --user $GOAD_USER
+```
+
+Verify they were added:
+
+```bash
+ludus ansible role list --user $GOAD_USER
+```
+
+### 1.2 Snapshot the clean GOAD-Light state
+
+Before any change, lock in the current working state so you can roll back:
+
+```bash
+ludus --user $GOAD_USER snapshot create goad-light-clean \
+  --description "GOAD-Light deployed, pre-Wazuh"
+```
+
+### 1.3 Pull and edit the current range config
+
+```bash
+ludus --user $GOAD_USER range config get > goad-light.yml
+cp goad-light.yml goad-light.yml.bak
+```
+
+Open `goad-light.yml` in your editor and modify it to look like this:
+
+```yaml
+ludus:
+  - vm_name: "{{ range_id }}-GOAD-DC01"
+    hostname: "{{ range_id }}-DC01"
+    template: win2019-server-x64-template
+    vlan: 10
+    ip_last_octet: 10
+    ram_gb: 4
+    cpus: 2
+    windows:
+      sysprep: true
+    roles:
+      - aleemladha.ludus_wazuh_agent
+    role_vars:
+      ludus_wazuh_siem_server: "10.3.10.99"
+
+  - vm_name: "{{ range_id }}-GOAD-DC02"
+    hostname: "{{ range_id }}-DC02"
+    template: win2019-server-x64-template
+    vlan: 10
+    ip_last_octet: 11
+    ram_gb: 4
+    cpus: 2
+    windows:
+      sysprep: true
+    roles:
+      - aleemladha.ludus_wazuh_agent
+    role_vars:
+      ludus_wazuh_siem_server: "10.3.10.99"
+
+  - vm_name: "{{ range_id }}-GOAD-SRV02"
+    hostname: "{{ range_id }}-SRV02"
+    template: win2019-server-x64-template
+    vlan: 10
+    ip_last_octet: 22
+    ram_gb: 4
+    cpus: 2
+    windows:
+      sysprep: true
+    roles:
+      - aleemladha.ludus_wazuh_agent
+    role_vars:
+      ludus_wazuh_siem_server: "10.3.10.99"
+
+  - vm_name: "{{ range_id }}-kali"
+    hostname: "{{ range_id }}-kali"
+    template: kali-x64-desktop-template
+    vlan: 10
+    ip_last_octet: 99
+    ram_gb: 8
+    cpus: 4
+    linux: true
+    testing:
+      snapshot: false
+      block_internet: false
+    roles:
+      - aleemladha.wazuh_server_install
+    role_vars:
+      wazuh_admin_password: Wazuh-123
+```
+
+**Key changes:**
+
+- Added `roles:` and `role_vars:` blocks to all 3 Windows VMs (pointing them at Kali)
+- Added the same on Kali but using `aleemladha.wazuh_server_install`
+- Bumped Kali RAM from `4` to `8` GB — Wazuh's indexer will OOM on 4 GB
+
+> **RAM math:** DC01 (4) + DC02 (4) + SRV02 (4) + Kali (8) + Router (~1) = **21 GB** committed. On a 32 GB host that leaves ~11 GB for Proxmox + ZFS cache. Tight but workable.
+
+### 1.4 Power off Kali to allow the RAM resize
+
+```bash
+ludus --user $GOAD_USER power off --name ${GOAD_USER}-kali
+```
+
+Wait until `ludus --user $GOAD_USER range status` shows Kali as `Off`.
+
+### 1.5 Apply the updated config
+
+```bash
+ludus --user $GOAD_USER range config set --file goad-light.yml
+```
+
+If YAML is invalid, the error message will point at the line — fix and retry.
+
+### 1.6 Power Kali back on
+
+```bash
+ludus --user $GOAD_USER power on --name ${GOAD_USER}-kali
+```
+
+Wait ~2 minutes for Kali to fully boot.
+
+### 1.7 Deploy the Wazuh roles
+
+```bash
+ludus --user $GOAD_USER range deploy --tags user-defined-roles
+```
+
+Monitor in another terminal:
+
+```bash
+ludus --user $GOAD_USER range logs -f
+```
+
+**Expected timing:**
+
+- Wazuh server install on Kali: **30–45 minutes** (downloads OpenSearch, Wazuh manager, dashboard, filebeat)
+- Each Windows agent install: **3–5 minutes**
+
+A successful run ends with a `PLAY RECAP` showing `failed=0` for every host.
+
+---
+
+## Phase 2 — Verify Wazuh Is Running
+
+### 2.1 Check the dashboard
+
+From any machine with WireGuard access, open:
+
+```
+https://10.3.10.99/
+```
+
+Click through the self-signed cert warning. Login:
+
+```
+Username: admin
+Password: Wazuh-123
+```
+
+### 2.2 Verify all 3 agents are Active
+
+In the dashboard: **☰ menu → Endpoints summary → Agents**
+
+You should see:
+
+| ID | Name | IP | Status |
+|----|------|----|----|
+| 001 | kingslanding | 10.3.10.10 | active |
+| 002 | winterfell | 10.3.10.11 | active |
+| 003 | castelblack | 10.3.10.22 | active |
+
+> Hostnames are `kingslanding` / `winterfell` / `castelblack` (set by GOAD's Ansible during domain provisioning), not the Ludus VM names.
+
+### 2.3 If an agent shows Disconnected
+
+SSH into Kali:
+
+```bash
+ludus --user $GOAD_USER shell ${GOAD_USER}-kali
+sudo /var/ossec/bin/agent_control -l
+```
+
+Then RDP into the failing Windows VM and check the agent:
+
+```powershell
+Get-Service Wazuh
+Test-NetConnection 10.3.10.99 -Port 1514
+Get-Content "C:\Program Files (x86)\ossec-agent\ossec.log" -Tail 30
+Restart-Service Wazuh
+```
+
+### 2.4 Snapshot this state
+
+```bash
+ludus --user $GOAD_USER snapshot create goad-wazuh-deployed \
+  --description "Wazuh server + 3 agents active"
+```
+
+---
+
+## Phase 3 — Install Sysmon and Enable PowerShell Logging
+
+This is the highest-impact tuning step. Without Sysmon, Wazuh sees only basic Windows event logs and misses most of what attackers do (process command lines, network connections, file/registry changes, etc.).
+
+### 3.1 The all-in-one PowerShell setup script
+
+Save the following as `C:\setup-wazuh-detection.ps1` on each Windows VM (RDP in, paste into Notepad, save as `.ps1`):
+
+```powershell
+#Requires -RunAsAdministrator
+<#
+    Wazuh Detection Stack Setup - Phase 1 + 2
+    Installs Sysmon with SwiftOnSecurity config and configures Wazuh agent
+    to ingest Sysmon + PowerShell event channels.
+
+    Safe to re-run - every step is idempotent.
+#>
+
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+
+function Write-Step { param($msg) Write-Host "`n[+] $msg" -ForegroundColor Cyan }
+function Write-Ok   { param($msg) Write-Host "    $msg" -ForegroundColor Green }
+function Write-Warn { param($msg) Write-Host "    $msg" -ForegroundColor Yellow }
+function Write-Err  { param($msg) Write-Host "    $msg" -ForegroundColor Red }
+
+# ---------------------------------------------------------------------
+# 1. Download Sysmon + SwiftOnSecurity config
+# ---------------------------------------------------------------------
+Write-Step "Downloading Sysmon and SwiftOnSecurity config"
+
+$sysmonDir = "C:\Tools\Sysmon"
+New-Item -ItemType Directory -Path $sysmonDir -Force | Out-Null
+$sysmonExe  = "$sysmonDir\Sysmon64.exe"
+$sysmonConf = "$sysmonDir\sysmonconfig.xml"
+
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+Invoke-WebRequest -Uri "https://live.sysinternals.com/Sysmon64.exe" -OutFile $sysmonExe
+Write-Ok "Sysmon64.exe downloaded"
+
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml" -OutFile $sysmonConf
+Write-Ok "sysmonconfig.xml downloaded"
+
+# ---------------------------------------------------------------------
+# 2. Install or update Sysmon
+# ---------------------------------------------------------------------
+Write-Step "Installing or updating Sysmon"
+
+$svc = Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue
+if ($svc) {
+    & $sysmonExe -accepteula -c $sysmonConf | Out-Null
+    Write-Ok "Sysmon config updated"
+} else {
+    & $sysmonExe -accepteula -i $sysmonConf | Out-Null
+    Write-Ok "Sysmon installed"
+}
+
+Start-Sleep -Seconds 2
+$svc = Get-Service Sysmon64
+if ($svc.Status -eq "Running") { Write-Ok "Sysmon64 running" } else { Write-Err "Sysmon64 NOT running" }
+
+# ---------------------------------------------------------------------
+# 3. Edit ossec.conf to ingest Sysmon + PowerShell channels
+# ---------------------------------------------------------------------
+Write-Step "Updating Wazuh agent ossec.conf"
+
+$ossecConf = "C:\Program Files (x86)\ossec-agent\ossec.conf"
+$backup = "$ossecConf.bak-$(Get-Date -Format 'yyyyMMddHHmmss')"
+Copy-Item $ossecConf $backup
+Write-Ok "Backup: $backup"
+
+$content = Get-Content $ossecConf -Raw
+
+$newBlocks = @"
+
+  <localfile>
+    <location>Microsoft-Windows-Sysmon/Operational</location>
+    <log_format>eventchannel</log_format>
+  </localfile>
+
+  <localfile>
+    <location>Microsoft-Windows-PowerShell/Operational</location>
+    <log_format>eventchannel</log_format>
+  </localfile>
+
+"@
+
+if ($content -notmatch "Microsoft-Windows-Sysmon/Operational") {
+    $content = $content -replace "</ossec_config>", "$newBlocks</ossec_config>"
+    Set-Content -Path $ossecConf -Value $content -Encoding UTF8
+    Write-Ok "Added Sysmon + PowerShell localfile blocks"
+} else {
+    Write-Warn "Blocks already present - skipping"
+}
+
+# ---------------------------------------------------------------------
+# 4. Enable PowerShell logging via registry (GPO fallback)
+# ---------------------------------------------------------------------
+Write-Step "Enabling PowerShell logging via registry"
+
+$psLog = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging"
+if (-not (Test-Path $psLog)) { New-Item -Path $psLog -Force | Out-Null }
+Set-ItemProperty -Path $psLog -Name "EnableScriptBlockLogging" -Value 1 -Type DWord -Force
+Set-ItemProperty -Path $psLog -Name "EnableScriptBlockInvocationLogging" -Value 1 -Type DWord -Force
+
+$psMod = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging"
+if (-not (Test-Path $psMod)) { New-Item -Path $psMod -Force | Out-Null }
+Set-ItemProperty -Path $psMod -Name "EnableModuleLogging" -Value 1 -Type DWord -Force
+
+$psModNames = "$psMod\ModuleNames"
+if (-not (Test-Path $psModNames)) { New-Item -Path $psModNames -Force | Out-Null }
+Set-ItemProperty -Path $psModNames -Name "*" -Value "*" -Type String -Force
+
+Write-Ok "ScriptBlock + Module logging enabled"
+
+# ---------------------------------------------------------------------
+# 5. Restart Wazuh agent
+# ---------------------------------------------------------------------
+Write-Step "Restarting Wazuh agent"
+
+Restart-Service Wazuh -Force
+Start-Sleep -Seconds 5
+$wsvc = Get-Service Wazuh
+if ($wsvc.Status -eq "Running") { Write-Ok "Wazuh restarted" } else { Write-Err "Wazuh NOT running" }
+
+# ---------------------------------------------------------------------
+# 6. Sanity check
+# ---------------------------------------------------------------------
+$recent = Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" -MaxEvents 3 -ErrorAction SilentlyContinue
+if ($recent) { Write-Ok "Sysmon producing events ($($recent.Count) recent found)" }
+
+Write-Host "`n========================================" -ForegroundColor Green
+Write-Host "  Setup complete on $env:COMPUTERNAME" -ForegroundColor Green
+Write-Host "========================================" -ForegroundColor Green
+```
+
+### 3.2 Run on each Windows VM
+
+RDP into each (`10.3.10.10`, `.11`, `.22`), open **PowerShell as Administrator**, and run:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+C:\setup-wazuh-detection.ps1
+```
+
+### 3.3 Verify in Wazuh dashboard
+
+Go to **Threat Hunting** → in the **DQL search bar at the top** (not the filter dialog), enter:
+
+```
+data.win.system.providerName: ("Microsoft-Windows-Sysmon" or "Microsoft-Windows-PowerShell")
+```
+
+Within ~1 minute you should see hundreds of events. The **Top 10 MITRE ATT&CKs** widget will start populating automatically.
+
+> **Common pitfall:** if you used the "Add filter" button, you'll be in the OpenSearch DSL editor which expects JSON. Always use the top DQL search bar for human-readable queries.
+
+---
+
+## Phase 4 — Add Custom Detection Rules
+
+The default Wazuh ruleset is broad but doesn't have GOAD-specific detections. We'll add targeted rules for the classic AD attacks GOAD lets you practice.
+
+### 4.1 SSH into Kali and edit local rules
+
+```bash
+ludus --user $GOAD_USER shell ${GOAD_USER}-kali
+sudo nano /var/ossec/etc/rules/local_rules.xml
+```
+
+Paste this (replace existing content or add inside the existing `<group>`):
+
+```xml
+<group name="goad,custom,">
+
+  <!-- Kerberoasting: TGS request with weak RC4 encryption -->
+  <rule id="100100" level="10">
+    <if_sid>60103</if_sid>
+    <field name="win.eventdata.ticketEncryptionType">0x17</field>
+    <field name="win.eventdata.serviceName" negate="yes">krbtgt|.*\$</field>
+    <description>Possible Kerberoasting: RC4 TGS request for $(win.eventdata.serviceName) by $(win.eventdata.targetUserName)</description>
+    <mitre>
+      <id>T1558.003</id>
+    </mitre>
+  </rule>
+
+  <!-- AS-REP Roasting: pre-auth disabled -->
+  <rule id="100101" level="12">
+    <if_sid>60103</if_sid>
+    <field name="win.eventdata.preAuthType">0</field>
+    <description>Possible AS-REP Roasting: pre-auth disabled for $(win.eventdata.targetUserName)</description>
+    <mitre>
+      <id>T1558.004</id>
+    </mitre>
+  </rule>
+
+  <!-- Encoded PowerShell -->
+  <rule id="100104" level="10">
+    <if_sid>91802,255000</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)-[eE][nNcC]</field>
+    <description>Encoded PowerShell command: $(win.eventdata.commandLine)</description>
+    <mitre>
+      <id>T1059.001</id>
+      <id>T1027</id>
+    </mitre>
+  </rule>
+
+  <!-- BloodHound / SharpHound -->
+  <rule id="100105" level="12">
+    <if_sid>61603,255000</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)SharpHound|bloodhound|Invoke-BloodHound</field>
+    <description>BloodHound collector: $(win.eventdata.commandLine)</description>
+    <mitre>
+      <id>T1087.002</id>
+      <id>T1018</id>
+    </mitre>
+  </rule>
+
+  <!-- Mimikatz patterns -->
+  <rule id="100106" level="14">
+    <if_sid>61603,91802,255000</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)sekurlsa|kerberos::list|lsadump|privilege::debug|invoke-mimikatz</field>
+    <description>Mimikatz pattern: $(win.eventdata.commandLine)</description>
+    <mitre>
+      <id>T1003.001</id>
+    </mitre>
+  </rule>
+
+  <!-- LSASS access (Sysmon EID 10) -->
+  <rule id="100103" level="13">
+    <if_sid>61609</if_sid>
+    <field name="win.eventdata.targetImage" type="pcre2">lsass\.exe$</field>
+    <field name="win.eventdata.grantedAccess" type="pcre2">0x1010|0x1410|0x1438|0x143a|0x1fffff</field>
+    <description>Suspicious LSASS access from $(win.eventdata.sourceImage)</description>
+    <mitre>
+      <id>T1003.001</id>
+    </mitre>
+  </rule>
+
+  <!-- Scheduled task creation -->
+  <rule id="100107" level="10">
+    <if_sid>60103</if_sid>
+    <field name="win.system.eventID">^4698$</field>
+    <description>Scheduled task created: $(win.eventdata.taskName) by $(win.eventdata.subjectUserName)</description>
+    <mitre>
+      <id>T1053.005</id>
+    </mitre>
+  </rule>
+
+</group>
+```
+
+Save: `Ctrl+O`, `Enter`, `Ctrl+X`.
+
+### 4.2 Validate the rules
+
+```bash
+sudo /var/ossec/bin/wazuh-logtest
+```
+
+Hit `Ctrl+C` to exit if it loads with no errors. If it complains about syntax, fix the XML and re-run.
+
+### 4.3 Restart the manager
+
+```bash
+sudo systemctl restart wazuh-manager
+sudo tail -30 /var/ossec/logs/ossec.log
+```
+
+Look for `Started wazuh-analysisd` near the bottom with no rule-parsing errors.
+
+---
+
+## Phase 5 — Test Detections with Real Attacks
+
+Run these from Kali to fire each custom rule. After each, check the dashboard with the filter:
+
+```
+rule.id: (100100 OR 100101 OR 100103 OR 100104 OR 100105 OR 100106 OR 100107)
+```
+
+### 5.1 AS-REP Roasting (rule 100101, level 12)
+
+GOAD-Light's `s.baratheon` has Kerberos pre-auth disabled — the attack always succeeds:
+
+```bash
+cat > /tmp/users.txt <<EOF
+s.baratheon
+b.stark
+j.snow
+arya.stark
+brandon.stark
+EOF
+
+impacket-GetNPUsers sevenkingdoms.local/ -usersfile /tmp/users.txt -no-pass -dc-ip 10.3.10.10
+```
+
+You'll get `s.baratheon`'s AS-REP hash printed. Wazuh fires rule **100101**.
+
+### 5.2 Kerberoasting (rule 100100, level 10)
+
+```bash
+impacket-GetUserSPNs sevenkingdoms.local/stephen.travolta:Password123! \
+  -dc-ip 10.3.10.10 -request
+```
+
+### 5.3 BloodHound Collection (rule 100105, level 12)
+
+```bash
+bloodhound-python -u stephen.travolta -p 'Password123!' \
+  -d sevenkingdoms.local -ns 10.3.10.10 -c All
+```
+
+### 5.4 Encoded PowerShell (rule 100104, level 10)
+
+RDP into any Windows VM, open PowerShell:
+
+```powershell
+$enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("Get-Process"))
+powershell.exe -EncodedCommand $enc
+```
+
+### 5.5 Mimikatz pattern (rule 100106, level 14)
+
+Even a benign command with a Mimikatz string triggers the regex:
+
+```powershell
+echo "sekurlsa::logonpasswords"
+```
+
+For an actual Mimikatz test, disable Defender first:
+
+```powershell
+Set-MpPreference -DisableRealtimeMonitoring $true
+```
+
+### 5.6 Scheduled task creation (rule 100107, level 10)
+
+```powershell
+schtasks /create /tn "test-detection" /tr "calc.exe" /sc once /st 23:59 /ru SYSTEM
+```
+
+### 5.7 LSASS access (rule 100103, level 13)
+
+With Defender disabled, on a Windows VM:
+
+```powershell
+rundll32.exe C:\windows\System32\comsvcs.dll, MiniDump (Get-Process lsass).Id C:\Windows\Temp\lsass.dmp full
+```
+
+Re-enable Defender after:
+
+```powershell
+Set-MpPreference -DisableRealtimeMonitoring $false
+```
+
+---
+
+## Phase 6 — Agent Grouping (Optional)
+
+Useful once you start writing rules that should only apply to DCs vs. member servers.
+
+### 6.1 Create groups
+
+```bash
+ludus --user $GOAD_USER shell ${GOAD_USER}-kali
+sudo /var/ossec/bin/agent_groups -a -g dc
+sudo /var/ossec/bin/agent_groups -a -g member-server
+```
+
+### 6.2 Assign agents
+
+```bash
+# kingslanding (DC01) and winterfell (DC02) are DCs
+sudo /var/ossec/bin/agent_groups -a -i 001 -g dc
+sudo /var/ossec/bin/agent_groups -a -i 002 -g dc
+
+# castelblack (SRV02) is a member server
+sudo /var/ossec/bin/agent_groups -a -i 003 -g member-server
+```
+
+### 6.3 Verify
+
+```bash
+sudo /var/ossec/bin/agent_groups -l
+```
+
+Group-specific config files live at `/var/ossec/etc/shared/dc/` and `/var/ossec/etc/shared/member-server/`. You can drop a custom `agent.conf` in each to push group-targeted localfile entries, FIM paths, etc.
+
+---
+
+## Phase 7 — Snapshot the Tuned State
+
+```bash
+ludus --user $GOAD_USER snapshot create goad-wazuh-tuned \
+  --description "GOAD-Light + Wazuh + Sysmon + PS logging + custom rules"
+```
+
+You can now break things freely and revert with:
+
+```bash
+ludus --user $GOAD_USER snapshot revert goad-wazuh-tuned
+```
+
+---
+
+## Troubleshooting
+
+### Dashboard won't load
+
+```bash
+ludus --user $GOAD_USER shell ${GOAD_USER}-kali
+sudo systemctl status wazuh-indexer wazuh-dashboard wazuh-manager
+sudo journalctl -u wazuh-indexer -n 50
+```
+
+If `wazuh-indexer` keeps restarting → OOM. Increase Kali RAM to 10 GB or close the Kali desktop session.
+
+### Login fails despite correct password
+
+```bash
+sudo /usr/share/wazuh-indexer/plugins/opensearch-security/tools/wazuh-passwords-tool.sh \
+  -u admin -p 'Wazuh-123'
+sudo systemctl restart wazuh-dashboard
+```
+
+Wait 2 minutes and retry login.
+
+### Agent shows "Never connected"
+
+On the Windows VM:
+
+```powershell
+Test-NetConnection 10.3.10.99 -Port 1514
+Test-NetConnection 10.3.10.99 -Port 1515
+Restart-Service Wazuh
+Get-Content "C:\Program Files (x86)\ossec-agent\ossec.log" -Tail 30
+```
+
+Look for `Connected to the server` in the log.
+
+### Custom rule not firing
+
+Check the actual rule ID that did match the event:
+
+1. Dashboard → **Events** tab
+2. Filter for the event you triggered
+3. Expand it → note `rule.id`
+4. Update your `<if_sid>` chain in `local_rules.xml` to include that parent rule ID
+5. Restart `wazuh-manager`
+
+### Verify Sysmon ingestion
+
+DQL filter in Threat Hunting:
+
+```
+data.win.system.providerName: "Microsoft-Windows-Sysmon"
+```
+
+If no results: re-check `ossec.conf` on the agent has the localfile block and the service was restarted.
+
+---
+
+## Useful Commands Cheatsheet
+
+```bash
+# Range management
+ludus --user $GOAD_USER range status
+ludus --user $GOAD_USER range list
+ludus --user $GOAD_USER range logs -f
+
+# Power
+ludus --user $GOAD_USER power off --name <vm-name>
+ludus --user $GOAD_USER power on --name <vm-name>
+
+# Snapshots
+ludus --user $GOAD_USER snapshot list
+ludus --user $GOAD_USER snapshot create <name> --description "..."
+ludus --user $GOAD_USER snapshot revert <name>
+
+# Shell access
+ludus --user $GOAD_USER shell <vm-name>
+
+# Deploy roles only (no full rebuild)
+ludus --user $GOAD_USER range deploy --tags user-defined-roles
+ludus --user $GOAD_USER range deploy --tags user-defined-roles --limit <vm-name>
+
+# On Kali (Wazuh server)
+sudo systemctl status wazuh-manager wazuh-indexer wazuh-dashboard
+sudo /var/ossec/bin/agent_control -l                # list all agents
+sudo /var/ossec/bin/agent_groups -l                 # list groups
+sudo /var/ossec/bin/wazuh-logtest                   # validate rules
+sudo tail -f /var/ossec/logs/alerts/alerts.json     # live alerts
+sudo tail -f /var/ossec/logs/archives/archives.json # all events (if archive logging on)
+
+# On Windows agents
+Get-Service Wazuh
+Restart-Service Wazuh
+Get-Content "C:\Program Files (x86)\ossec-agent\ossec.log" -Tail 30
+Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" -MaxEvents 10
+```
+
+---
+
+## Useful DQL Queries
+
+| Goal | Query |
+|------|-------|
+| All Sysmon events | `data.win.system.providerName: "Microsoft-Windows-Sysmon"` |
+| All PowerShell events | `data.win.system.providerName: "Microsoft-Windows-PowerShell"` |
+| Custom GOAD rules only | `rule.groups: "goad"` |
+| High severity (level ≥ 10) | `rule.level >= 10` |
+| Specific agent | `agent.name: "kingslanding"` |
+| Failed Windows logons | `data.win.system.eventID: "4625"` |
+| Successful logons | `data.win.system.eventID: "4624"` |
+| Sysmon process creation | `data.win.system.eventID: "1" and data.win.system.providerName: "Microsoft-Windows-Sysmon"` |
+| Kerberos TGS requests | `data.win.system.eventID: "4769"` |
+| Kerberos TGT requests | `data.win.system.eventID: "4768"` |
+| BloodHound / SharpHound | `rule.id: 100105` |
+| Mimikatz patterns | `rule.id: 100106` |
+
+---
+
+## Where to Go Next
+
+- **Atomic Red Team** — `Invoke-AtomicTest` systematically runs every MITRE technique; pair with Wazuh to find coverage gaps
+- **Slack/webhook alerting** — add an `<integration>` block in `ossec.conf` for level ≥ 10 alerts
+- **File Integrity Monitoring** — already partially on; tune for `\\SYSVOL\sevenkingdoms.local\Policies\`
+- **Vulnerability detection module** — Wazuh can match installed software against CVE feeds
+- **Active response** — auto-kill processes or block IPs on rule match
+- **Custom decoders** — for application-specific logs (IIS, MSSQL audit, ADCS)
+- **MITRE ATT&CK navigator export** — visualize which techniques you've detected vs. missed across all test attacks
+
+---
+
+## Default Credentials Reference
+
+| Service | URL/Host | Username | Password |
+|---------|----------|----------|----------|
+| Wazuh dashboard | https://10.3.10.99 | `admin` | `Wazuh-123` |
+| GOAD domain admin | sevenkingdoms.local | `stephen.travolta` | `Password123!` |
+| GOAD pre-auth disabled | sevenkingdoms.local | `s.baratheon` | (use AS-REP roast) |
+| GOAD SPN user | sevenkingdoms.local | `j.snow` | (use Kerberoast) |
+| Ludus admin | https://&lt;ludus-ip&gt;:8080 | `admin` | (your API key) |
+
+---
+
+*Last verified on GOAD-Light + Wazuh 4.8.0 + Ludus on Proxmox VE 8.x*
+
 ## References
 
 - GOAD: <https://github.com/Orange-Cyberdefense/GOAD>
