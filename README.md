@@ -1911,6 +1911,174 @@ ludus --user $GOAD_USER snapshot revert goad-wazuh-tuned
 
 ---
 
+## Phase 8 — Persistence and Auto-Recovery After Reboots
+
+**Short answer: yes, everything you installed survives reboots and auto-starts.** You don't need to re-run any scripts after powering the lab back on. This section explains what persists, what doesn't, and how to verify everything came back up cleanly.
+
+### 8.1 What survives reboots automatically
+
+| Component | How it persists | Startup behavior |
+|-----------|----------------|------------------|
+| Sysmon | Driver + binary installed in `C:\Windows\`, registered as service | Auto-start (Automatic), runs as LocalSystem before login |
+| Sysmon config | XML config baked into the service registration | Reloaded on service start |
+| Wazuh agent | Service installed in `C:\Program Files (x86)\ossec-agent\` | Auto-start, reads `ossec.conf` on boot |
+| `ossec.conf` edits | Plain text file on disk | Persists until manually changed |
+| PowerShell logging | Registry keys in `HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\` | Applied at every PS session start |
+| Wazuh manager / indexer / dashboard | Systemd services on Kali | All set to Automatic, start on boot |
+| Custom rules | `/var/ossec/etc/rules/local_rules.xml` on Kali | Loaded on `wazuh-manager` startup |
+| Historical events | OpenSearch indices on Kali's disk | Persistent across reboots |
+| Agent enrollments | `/var/ossec/etc/client.keys` on Kali + agents | Persistent, agents auto-reconnect |
+| Snapshots | Proxmox-level disk snapshots | Persistent until manually deleted |
+
+### 8.2 What you need to enable for full auto-recovery
+
+By default, Ludus-deployed VMs do **not** have Proxmox's "start at boot" enabled. After a Proxmox reboot they stay powered off until you manually start them. Enable autostart so the lab fully recovers on its own:
+
+```bash
+# SSH to the Proxmox host as root, then:
+for vmid in $(qm list | awk 'NR>1 {print $1}'); do
+  qm set $vmid --onboot 1
+done
+```
+
+For better resilience, also set a sensible startup order so dependencies come up first (router before VMs that need network, DCs before member servers, Kali last):
+
+```bash
+# Replace VM IDs with your actual ones from `qm list`
+qm set 109 --onboot 1 --startup order=1            # router (Debian)
+qm set 110 --onboot 1 --startup order=2,up=60      # DC01 - wait 60s before next VM
+qm set 111 --onboot 1 --startup order=3,up=30      # DC02
+qm set 112 --onboot 1 --startup order=4            # SRV02 (member server)
+qm set 113 --onboot 1 --startup order=5            # Kali (Wazuh server)
+```
+
+Verify:
+
+```bash
+qm config <vmid> | grep -E 'onboot|startup'
+```
+
+### 8.3 Boot sequence after a clean Proxmox reboot
+
+1. **Proxmox boots** → ~1 minute
+2. **VMs auto-start in order** → 3–5 minutes total
+3. **On each Windows VM (automatic):**
+   - `Sysmon64` service starts → begins logging to `Microsoft-Windows-Sysmon/Operational`
+   - `Wazuh` service starts → reads the Sysmon + PowerShell channels and ships to Kali
+4. **On Kali (automatic):**
+   - `wazuh-indexer` starts → ~30 seconds to load shards
+   - `wazuh-manager` starts → accepts agent connections
+   - `wazuh-dashboard` starts → web UI reachable
+5. **Agents reconnect**, buffered events flush, dashboard fully working
+
+**Total recovery time: ~5–10 minutes** from "press power button" to "everything green."
+
+### 8.4 Failure scenarios and recovery
+
+| Failure | Auto-recovers? | Manual steps | Data loss |
+|---------|---------------|--------------|-----------|
+| Single Windows VM down | Yes (on boot) | `ludus power on --name <vm>` | Minimal (events during boot only) |
+| Kali down | Yes (on boot) | `ludus power on --name <kali>` | Minimal (agents buffer events) |
+| Proxmox clean reboot | Yes, if `onboot=1` set | None if configured | Minimal |
+| Proxmox power cut (unclean) | Partial | May need manual service restart | Possible (rare disk corruption) |
+| Mini PC hardware failure | No | Full rebuild from configs | Total (unless off-box backup) |
+| Network partition (WireGuard) | Yes when network returns | None | None (internal lab continues) |
+
+### 8.5 Post-reboot verification
+
+After bringing the lab back, run this checklist:
+
+```bash
+# 1. All VMs powered on?
+ludus --user $GOAD_USER range status
+
+# 2. Wazuh services up on Kali?
+ludus --user $GOAD_USER shell ${GOAD_USER}-kali \
+  "sudo systemctl is-active wazuh-manager wazuh-indexer wazuh-dashboard"
+# Expected: active / active / active
+
+# 3. Agents reconnected?
+ludus --user $GOAD_USER shell ${GOAD_USER}-kali \
+  "sudo /var/ossec/bin/agent_control -l"
+# Expected: all 3 agents showing as Active
+```
+
+And from any Windows VM (via RDP):
+
+```powershell
+Get-Service Sysmon64, Wazuh | Select-Object Name, Status, StartType
+# Expected: both Running, both Automatic
+```
+
+If any service isn't running:
+
+```powershell
+# Windows
+Start-Service Sysmon64
+Start-Service Wazuh
+```
+
+```bash
+# Kali — start indexer first, wait, then the rest
+sudo systemctl start wazuh-indexer
+sleep 30
+sudo systemctl start wazuh-manager wazuh-dashboard
+```
+
+### 8.6 The one edge case — unclean power loss
+
+If Proxmox is power-cycled abruptly (power loss, hard reset), OpenSearch on Kali occasionally fails to recover its shards cleanly and the dashboard returns "OpenSearch not ready" indefinitely.
+
+Fix:
+
+```bash
+ludus --user $GOAD_USER shell ${GOAD_USER}-kali
+sudo systemctl restart wazuh-indexer
+sleep 60   # let shards recover
+sudo systemctl restart wazuh-manager wazuh-dashboard
+```
+
+Happens roughly once every 10–20 unclean reboots. Set Proxmox up on a UPS if you want to avoid it.
+
+### 8.7 Off-box config backup (recommended)
+
+Snapshots protect against software-level breakage but not hardware failure. Back up your configs off-box so you can rebuild from scratch on new hardware in ~2 hours:
+
+```bash
+# On the Ludus host
+mkdir -p ~/lab-backups && cd ~/lab-backups
+
+# Save the range config
+cp /root/goad-light.yml ./
+
+# Pull custom rules from Kali
+ludus --user $GOAD_USER shell ${GOAD_USER}-kali \
+  "sudo cat /var/ossec/etc/rules/local_rules.xml" > local_rules.xml
+
+# Save the PowerShell setup script
+cp /path/to/setup-wazuh-detection.ps1 ./
+
+# Tar it up
+tar czf lab-backup-$(date +%Y%m%d).tar.gz *.yml *.xml *.ps1
+```
+
+Then push the tar to a Git repo, cloud storage, or external drive — anywhere off the Geekom.
+
+For VM-level backups, configure Proxmox's built-in backup scheduler: **Datacenter → Backup → Add** in the Proxmox web UI. Point it at an external USB drive or NFS share, schedule it weekly.
+
+### 8.8 What you'd need to manually re-do (almost never)
+
+The only situations where you'd need to re-run setup steps:
+
+- You revert to a snapshot taken **before** Sysmon was installed
+- You destroy and redeploy a Ludus VM from template
+- You manually uninstalled Sysmon (`Sysmon64.exe -u`)
+- The Wazuh agent service was uninstalled (not just stopped)
+
+In normal operation — power off the mini PC for a vacation, come back, power it on — everything resumes exactly where it left off, with the same agents, the same rules, the same historical data, and the same dashboard.
+
+---
+
 ## Troubleshooting
 
 ### Dashboard won't load
